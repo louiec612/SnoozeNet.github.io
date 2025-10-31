@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="data:;base64,=">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Drowsiness Detection Dashboard</title>
+
+  <!-- Libraries (deferred for faster first paint; order preserved) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+
+  <style>
+/* ===================== THEME & GLOBAL ===================== */
+:root {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #21262d;
+  --accent: #2f81f7;
+  --accent-dim: #2f81f73a;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --radius: 10px;
+  --shadow: 0 4px 10px rgba(0,0,0,.25); /* cheaper shadow */
+  --transition: 140ms ease;              /* shorter transition */
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  overflow: hidden; /* Prevent scrollbars */
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Respect users who prefer less motion (saves work) */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+/* ===================== HEADER ===================== */
+header {
+  background: #0b0f14;
+  border-bottom: 1px solid var(--border);
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  contain: layout paint; /* isolate header */
+}
+header h1 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--accent);
+}
+.status-badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  background: #151b22;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  transition: var(--transition);
+}
+.status-badge.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: #111a25;
+  box-shadow: 0 0 6px var(--accent-dim);
+}
+
+/* ===================== MAIN LAYOUT ===================== */
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: 10px;
+  padding: 10px;
+  overflow: hidden;
+  min-height: 0; /* allows children to overflow-scroll properly */
+  contain: layout paint; /* isolate main grid */
+}
+
+/* Collapse to one column when debug is hidden */
+body.debug-off main {
+  grid-template-columns: 1fr;
+  justify-content: center;
+  align-items: center;
+  padding: 0 5vw; /* side breathing space on wide screens */
+}
+
+body.debug-off main > .panel {
+  width: 100%;
+  max-width: 1200px;  /* ✅ wider camera panel */
+  margin: 0 auto;
+  height: auto;
+}
+
+body.debug-off .stage {
+  
+  max-height: 80vh;   /* keep it big but not overflowing */
+}
+
+
+/* Panels */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;           /* critical: prevent flex overflow stretching */
+  transition: var(--transition);
+  contain: layout paint;   /* each panel paints in isolation */
+}
+
+/* ===================== CONTROLS ===================== */
+.controls {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.btn {
+  background: #0b1116;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: var(--transition);
+  will-change: background, border-color; /* micro hint */
+}
+.btn:hover:not([disabled]) {
+  background: #151c25;
+  border-color: var(--accent);
+}
+.btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+/* ===================== CAMERA STAGE ===================== */
+.stage {
+  position: relative;
+  width: 100%;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #0f151c;
+  border: 1px solid var(--border);
+  max-height: calc(100vh - 220px);
+  will-change: transform;       /* GPU hint */
+  transform: translateZ(0);     /* promote layer */
+  contain: layout paint;        /* isolate heavy paints */
+}
+
+/* Ensure video shows and fills area correctly */
+.stage video {
+  position: relative;
+  display: block;
+  width:100%;
+  height: 100%;
+  object-fit: cover;   /* fill container */
+  z-index: 1;
+  background: #000;
+  will-change: transform;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* Overlay canvases on top of video */
+
+.stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  pointer-events: none;
+  will-change: transform;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* ===================== RIGHT COLUMN ===================== */
+.right-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  transition: var(--transition);
+  /* Skip rendering work when scrolled out or hidden by toggle */
+  content-visibility: auto;
+  contain-intrinsic-size: 800px 600px; /* reserve size cheaply */
+}
+
+/* Hide right column when debug is off */
+body.debug-off .right-col { display: none; }
+
+/* Crop panels */
+.crop-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.crop-card {
+  background: #0f141a;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+  padding: 8px;
+}
+.crop-card h3 {
+  margin: 2px 0 6px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+#eyeCanvas, #mouthCanvas {
+  image-rendering: crisp-edges;  /* crisper small canvases */
+  image-rendering: pixelated;
+}
+
+/* Metrics grid */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 6px;
+}
+.metric-box {
+  background: #10161d;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.metric-box code { color: var(--accent); }
+
+/* Chart panel */
+#tcnChart {
+  width: 100%;
+  height: 140px;
+  will-change: contents; /* hint for frequent updates */
+}
+
+/* Baseline snapshot */
+#baselineBox {
+  background: #0e141b;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  font-size: 0.85rem;
+}
+#baselineImg {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-top: 6px;
+}
+#normSummary {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+#procCanvas {
+  position: absolute;
+  inset: 0;
+  width: auto !important;
+  height: auto !important;
+  max-width: 100%;
+  max-height: 100%;
+  margin: auto;
+  object-fit: contain; /* keep aspect ratio */
+  display: none;       /* stays hidden until needed */
+  z-index: 2;
+}
+
+
+/* Responsive adjustments */
+@media (max-width: 980px) {
+  main { grid-template-columns: 1fr; }
+  .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stage { max-height: none; }
+}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SnoozeNet</h1>
+    <div id="sessionStatus" class="status-badge">Idle</div>
+  </header>
+
+  <main>
+    <!-- Left: Camera & Controls -->
+    <section class="panel">
+      <div class="controls">
+        <button id="reqCamBtn" class="btn">Request Camera</button>
+        <button id="startBtn" class="btn" disabled>Start Session</button>
+        <button id="stopBtn" class="btn" disabled>Stop</button>
+        <button id="debugToggleBtn" class="btn">Toggle Debug</button>
+      </div>
+
+      <div class="stage">
+        <video id="video"autoplay playsinline muted></video>
+        <canvas id="procCanvas" width="854" height="480"></canvas>
+        <canvas id="overlayCanvas" width="854" height="480" style="pointer-events:none;"></canvas>
+      </div>
+
+      <canvas id="downCanvas" width="854" height="480" style="display:none;"></canvas>
+
+      <div id="baselineBox">
+        <strong>Baseline Snapshot</strong>
+        <button id="downloadBaselineBtn" class="btn" disabled style="float:right;">Download</button>
+        <div id="normSummary">μ/σ — not ready</div>
+      </div>
+    </section>
+
+    <!-- Right: Debug / Metrics -->
+    <aside class="right-col">
+      <div class="panel">
+        <div class="crop-grid">
+          <div class="crop-card">
+            <h3>Unified Eye</h3>
+            <canvas id="eyeCanvas" width="90" height="90"></canvas>
+          </div>
+          <div class="crop-card">
+            <h3>Mouth</h3>
+            <canvas id="mouthCanvas" width="120" height="120"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel metrics">
+        <div class="metric-box">Eye: <code id="eyeState">-</code></div>
+        <div class="metric-box">Blink: <code id="blinkState">-</code></div>
+        <div class="metric-box">Mouth: <code id="mouthState">-</code></div>
+        <div class="metric-box">Nod: <code id="nodState">-</code></div>
+        <div class="metric-box">Yaw: <code id="yaw">-</code></div>
+        <div class="metric-box">Pitch: <code id="pitch">-</code></div>
+        <div class="metric-box">Roll: <code id="roll">-</code></div>
+        <div class="metric-box">FPS: <code id="fps">0</code></div>
+        <div class="metric-box">Dominant Eye: <code id="domEyeTxt">-</code></div>
+        <div class="metric-box">TCN: <code id="tcnText">—</code></div>
+      </div>
+
+      <div class="panel">
+        <h3 style="margin:0 0 8px; font-size: 0.95rem; color: var(--muted);">TCN Output Trend</h3>
+        <canvas id="tcnChart"></canvas>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Your runtime logic (kept last; libs are deferred above) -->
+  <script src="realtime_tcn.js"></script>
+
+  <script>
+  /* ========== BASIC UI BEHAVIOR (unchanged) ========== */
+
+
+  </script>
+</body>
+</html>
